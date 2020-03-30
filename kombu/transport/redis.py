@@ -23,6 +23,7 @@ from kombu.utils.scheduling import cycle_by_name
 from kombu.utils.url import _parse_url
 from kombu.utils.uuid import uuid
 from kombu.utils.compat import _detect_environment
+from kombu.utils.functional import accepts_argument
 
 from . import virtual
 
@@ -42,6 +43,8 @@ crit, warn = logger.critical, logger.warn
 
 DEFAULT_PORT = 6379
 DEFAULT_DB = 0
+
+DEFAULT_HEALTH_CHECK_INTERVAL = 25
 
 PRIORITY_STEPS = [0, 3, 6, 9]
 
@@ -121,7 +124,7 @@ def Mutex(client, name, expire):
             try:
                 with client.pipeline(True) as pipe:
                     pipe.watch(name)
-                    if pipe.get(name) == lock_id:
+                    if bytes_to_str(pipe.get(name)) == lock_id:
                         pipe.multi()
                         pipe.delete(name)
                         pipe.execute()
@@ -342,6 +345,14 @@ class MultiChannelPoller(object):
                     num=channel.unacked_restore_limit,
                 )
 
+    def maybe_check_subclient_health(self):
+        for channel in self._channels:
+            # only if subclient property is cached
+            client = channel.__dict__.get('subclient')
+            if client is not None \
+                    and callable(getattr(client, 'check_health', None)):
+                client.check_health()
+
     def on_readable(self, fileno):
         chan, type = self._fd_to_chan[fileno]
         if chan.qos.can_consume():
@@ -416,7 +427,9 @@ class Channel(virtual.Channel):
     socket_connect_timeout = None
     socket_keepalive = None
     socket_keepalive_options = None
+    retry_on_timeout = None
     max_connections = 10
+    health_check_interval = DEFAULT_HEALTH_CHECK_INTERVAL
     #: Transport option to disable fanout keyprefix.
     #: Can also be string, in which case it changes the default
     #: prefix ('/{db}.') into to something else.  The prefix must
@@ -480,14 +493,15 @@ class Channel(virtual.Channel):
          'socket_keepalive_options',
          'queue_order_strategy',
          'max_connections',
+         'health_check_interval',
+         'retry_on_timeout',
          'priority_steps')  # <-- do not add comma here!
     )
 
     connection_class = redis.Connection if redis else None
 
     def __init__(self, *args, **kwargs):
-        super_ = super(Channel, self)
-        super_.__init__(*args, **kwargs)
+        super(Channel, self).__init__(*args, **kwargs)
 
         if not self.ack_emulation:  # disable visibility timeout
             self.QoS = virtual.QoS
@@ -679,9 +693,8 @@ class Channel(virtual.Channel):
             ret.append(self._receive_one(c))
         except Empty:
             pass
-        if c.connection is not None:
-            while c.connection.can_read(timeout=0):
-                ret.append(self._receive_one(c))
+        while c.connection is not None and c.connection.can_read(timeout=0):
+            ret.append(self._receive_one(c))
         return any(ret)
 
     def _receive_one(self, c):
@@ -765,7 +778,9 @@ class Channel(virtual.Channel):
 
     def _q_for_pri(self, queue, pri):
         pri = self.priority(pri)
-        return '%s%s%s' % ((queue, self.sep, pri) if pri else (queue, '', ''))
+        if pri:
+            return "{{{}}}{}{}".format(queue, self.sep, pri)
+        return queue
 
     def priority(self, n):
         steps = self.priority_steps
@@ -828,24 +843,6 @@ class Channel(virtual.Channel):
             if not values:
                 raise InconsistencyError(NO_ROUTE_ERROR.format(exchange, key))
             return [tuple(bytes_to_str(val).split(self.sep)) for val in values]
-
-    def _lookup_direct(self, exchange, routing_key):
-        if not exchange:
-            return [routing_key]
-
-        key = self.keyprefix_queue % exchange
-        pattern = ''
-        queue = routing_key
-        queue_bind = self.sep.join([
-            routing_key or '',
-            pattern,
-            queue or '',
-        ])
-        with self.conn_or_acquire() as client:
-            if client.sismember(key, queue_bind):
-                return [queue]
-
-        return []
 
     def _purge(self, queue):
         with self.conn_or_acquire() as client:
@@ -913,7 +910,20 @@ class Channel(virtual.Channel):
             'socket_connect_timeout': self.socket_connect_timeout,
             'socket_keepalive': self.socket_keepalive,
             'socket_keepalive_options': self.socket_keepalive_options,
+            'health_check_interval': self.health_check_interval,
+            'retry_on_timeout': self.retry_on_timeout,
         }
+
+        conn_class = self.connection_class
+
+        # If the connection class does not support the `health_check_interval`
+        # argument then remove it.
+        if (
+            hasattr(conn_class, '__init__') and
+            not accepts_argument(conn_class.__init__, 'health_check_interval')
+        ):
+            connparams.pop('health_check_interval')
+
         if conninfo.ssl:
             # Connection(ssl={}) must be a dict containing the keys:
             # 'ssl_cert_reqs', 'ssl_ca_certs', 'ssl_certfile', 'ssl_keyfile'
@@ -1064,6 +1074,14 @@ class Transport(virtual.Transport):
             [add_reader(fd, on_readable, fd) for fd in cycle.fds]
         loop.on_tick.add(on_poll_start)
         loop.call_repeatedly(10, cycle.maybe_restore_messages)
+        health_check_interval = connection.client.transport_options.get(
+            'health_check_interval',
+            DEFAULT_HEALTH_CHECK_INTERVAL
+        )
+        loop.call_repeatedly(
+            health_check_interval,
+            cycle.maybe_check_subclient_health
+        )
 
     def on_readable(self, fileno):
         """Handle AIO event for one of our file descriptors."""

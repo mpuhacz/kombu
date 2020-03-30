@@ -8,11 +8,14 @@ from itertools import count
 
 from case import Mock, mock, skip
 
-from kombu.five import items
+from kombu.five import (
+    items, PY3,
+)
 from kombu.utils import functional as utils
 from kombu.utils.functional import (
     ChannelPromise, LRUCache, fxrange, fxrangemax, memoize, lazy,
     maybe_evaluate, maybe_list, reprcall, reprkwargs, retry_over_time,
+    accepts_argument,
 )
 
 
@@ -227,6 +230,21 @@ class test_retry_over_time:
             )
 
     @mock.sleepdeprived(module=utils)
+    def test_retry_zero(self):
+        with pytest.raises(self.Predicate):
+            retry_over_time(
+                self.myfun, self.Predicate,
+                max_retries=0, errback=self.errback, interval_max=14,
+            )
+        assert self.index == 0
+        # no errback
+        with pytest.raises(self.Predicate):
+            retry_over_time(
+                self.myfun, self.Predicate,
+                max_retries=0, errback=None, interval_max=14,
+            )
+
+    @mock.sleepdeprived(module=utils)
     def test_retry_once(self):
         with pytest.raises(self.Predicate):
             retry_over_time(
@@ -261,7 +279,7 @@ class test_retry_over_time:
 
         assert retry_over_time(
             fun, self.Predicate,
-            max_retries=0, errback=None, interval_max=14) == 42
+            max_retries=None, errback=None, interval_max=14) == 42
         assert fun.calls == 11
 
 
@@ -295,3 +313,26 @@ def test_reprkwargs():
 
 def test_reprcall():
     assert reprcall('add', (2, 2), {'copy': True})
+
+
+class test_accepts_arg:
+    def function(self, foo, bar, baz="baz"):
+        pass
+
+    def test_valid_argument(self):
+        assert accepts_argument(self.function, 'self')
+        assert accepts_argument(self.function, 'foo')
+        assert accepts_argument(self.function, 'baz')
+
+    def test_invalid_argument(self):
+        assert not accepts_argument(self.function, 'random_argument')
+        if PY3:
+            assert not accepts_argument(test_accepts_arg, 'foo')
+
+    def test_raise_exception(self):
+        with pytest.raises(Exception):
+            accepts_argument(None, 'foo')
+
+        if not PY3:
+            with pytest.raises(Exception):
+                accepts_argument(test_accepts_arg, 'foo')
